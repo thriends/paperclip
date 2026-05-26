@@ -297,6 +297,17 @@ Recovery rule:
 
 This is an active-work continuity recovery.
 
+### 8.3 Active-Run Grace Window
+
+Stranded classification for `in_progress` issues honors a recent-productive grace window. An issue is NOT classified as stranded when its `latestRun` satisfies both of the following:
+
+- `status === "succeeded"` with a liveness-state in the productive set (`advanced`, `completed`, `blocked`, `needs_followup`)
+- `finishedAt` lies within `STRANDED_ASSIGNMENT_RECENT_PRODUCTIVE_GRACE_MS` (default `120000` ms = 2 minutes, env-tunable via the same name)
+
+This guard prevents a self-loop where recovery issues are created for multi-step lifecycles that have not yet completed (for example the soul-adapter pattern: a short ~5 minute run terminates productively, and the next iteration is triggered externally with a delay ranging from seconds to a few minutes). Without the grace window, every 30 second reconcile tick between iterations would fire a fresh `stranded_issue_recovery` wakeup; that wakeup is then evaluated at the following tick as a "repeated productive continuation" and moves the source issue to `blocked` (see PAP-2486).
+
+Genuine stranded cases — runs that finished longer ago than the grace window with no external follow-on activity — are still detected and re-enqueued as before.
+
 ## 9. Startup and Periodic Reconciliation
 
 Startup recovery and periodic recovery are different from normal wakeup delivery.
