@@ -60,6 +60,18 @@ const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "ti
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
+// Grace window after a productive terminal run (succeeded + advanced/completed/
+// blocked/needs_followup) during which `reconcileStrandedAssignedIssues` must
+// NOT classify the issue as stranded. Soul-adapter pattern: a run exits the
+// process after ~5min and the next iteration is triggered externally. Without
+// this grace window the very next 30s recovery tick treats the recently-finished
+// productive run as stranded and re-enqueues a continuation, which on the
+// following tick is detected as a "repeated productive continuation recovery"
+// and blocks the issue + spawns a recovery child (PAP-2486 self-loop).
+export const STRANDED_ASSIGNMENT_RECENT_PRODUCTIVE_GRACE_MS = process.env
+  .STRANDED_ASSIGNMENT_RECENT_PRODUCTIVE_GRACE_MS
+  ? Number(process.env.STRANDED_ASSIGNMENT_RECENT_PRODUCTIVE_GRACE_MS)
+  : 120_000;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
@@ -83,7 +95,7 @@ type RecoveryWakeup = (
 
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
-  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState"
+  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState" | "finishedAt"
 > | null;
 type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" };
 
@@ -379,6 +391,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         errorCode: heartbeatRuns.errorCode,
         contextSnapshot: heartbeatRuns.contextSnapshot,
         livenessState: heartbeatRuns.livenessState,
+        finishedAt: heartbeatRuns.finishedAt,
       })
       .from(heartbeatRuns)
       .where(
@@ -1884,6 +1897,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
         if (!isProductiveContinuationRun(successfulRun)) {
           result.successfulContinuationObserved += 1;
+          result.skipped += 1;
+          continue;
+        }
+
+        // PAP-2486 grace window: a productive terminal run that just finished
+        // is NOT stranded — the next iteration may still be in flight (soul
+        // adapter pattern: process exits after ~5min and the next tick is
+        // triggered externally). Without this guard, the very next 30s
+        // reconcile tick treats the recently-finished productive run as
+        // stranded and enqueues a continuation, which on the following tick
+        // is detected as a repeated productive continuation recovery and
+        // blocks the issue + spawns a recovery child.
+        if (
+          successfulRun.finishedAt &&
+          Date.now() - successfulRun.finishedAt.getTime() < STRANDED_ASSIGNMENT_RECENT_PRODUCTIVE_GRACE_MS
+        ) {
           result.skipped += 1;
           continue;
         }
