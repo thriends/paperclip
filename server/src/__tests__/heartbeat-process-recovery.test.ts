@@ -2827,4 +2827,69 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(runs).toHaveLength(1);
   });
+
+  it("does not spawn stranded_issue_recovery for a recently-finished productive run within grace window", async () => {
+    // Reproduces PAP-2486 self-loop: a soul-adapter run terminates productively
+    // (succeeded + advanced) and exits the process within ~5min. The very next
+    // 30s recovery tick must NOT classify that work as stranded — there has to
+    // be a grace window after a productive terminal run before recovery may
+    // re-enqueue another continuation, otherwise the recovery wakeup itself
+    // is treated as a "repeated productive continuation" on the following tick
+    // and the issue ends up blocked + spawning a "Recover stalled issue" child.
+    const { agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+
+    // Move finishedAt into the grace window (30s ago, well within the
+    // 2-minute STRANDED_ASSIGNMENT_RECENT_PRODUCTIVE_GRACE_MS budget that
+    // Task 4 introduces). The fixture default is a fixed historical date
+    // far outside any grace window.
+    const recentlyFinishedAt = new Date(Date.now() - 30_000);
+    await db
+      .update(heartbeatRuns)
+      .set({ finishedAt: recentlyFinishedAt, updatedAt: recentlyFinishedAt })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({ finishedAt: recentlyFinishedAt })
+      .where(eq(agentWakeupRequests.runId, runId));
+
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // Core assertion: no recovery wakeup must be created during the grace window.
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+
+    // Issue must remain in_progress (not blocked) and no recovery child issue
+    // should have been spawned.
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+
+    const recoveryIssues = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.originKind, "stranded_issue_recovery"));
+    expect(recoveryIssues).toHaveLength(0);
+
+    // No retry run should have been spawned: only the original run exists.
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.id).toBe(runId);
+
+    // No additional wakeup should have been enqueued by recovery — only the
+    // original "issue_assigned" wakeup from the fixture remains.
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    expect(wakeups).toHaveLength(1);
+  });
 });
